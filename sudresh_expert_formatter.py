@@ -324,26 +324,29 @@ def _hf_list_candidate_files(repo_id: str, split: str, token: Optional[str] = No
     return chosen
 
 
-def _iter_records_hf_via_hub_download(repo_id: str, split: str = 'train', limit: Optional[int] = None, token: Optional[str] = None) -> Iterator[Dict[str, Any]]:
+def _iter_records_hf_via_hub_download(
+    repo_id: str,
+    split: str = 'train',
+    limit: Optional[int] = None,
+    token: Optional[str] = None,
+    files: Optional[Sequence[str]] = None,
+) -> Iterator[Dict[str, Any]]:
     if hf_hub_download is None:
         raise ImportError('Для прямой загрузки с Hugging Face установите huggingface_hub: pip install -U huggingface_hub')
 
     token = install_hf_token_to_env(token)
-    files = _hf_list_candidate_files(repo_id=repo_id, split=split, token=token)
+    selected_files = list(files) if files else _hf_list_candidate_files(repo_id=repo_id, split=split, token=token)
     emitted = 0
-    multi_file = len(files) > 1
-    if multi_file:
-        print(f'[INFO] HF direct mode: найдено {len(files)} файлов-кандидатов в {repo_id}', file=sys.stderr)
+    if len(selected_files) > 1:
+        print(f'[INFO] HF direct mode: найдено {len(selected_files)} файлов-кандидатов в {repo_id}', file=sys.stderr)
 
-    for filename in files:
+    for filename in selected_files:
         local_path = hf_hub_download(repo_id=repo_id, repo_type='dataset', filename=filename, token=token)
         for rec in iter_records_local(local_path, limit=None):
             yield rec
             emitted += 1
             if limit is not None and emitted >= limit:
                 return
-        if not multi_file:
-            return
 
 
 def iter_records_hf(
@@ -355,17 +358,57 @@ def iter_records_hf(
     direct_only: bool = False,
 ) -> Iterator[Dict[str, Any]]:
     """
-    Сначала пробует стандартный путь через datasets.load_dataset.
-    Если HF/datasets/pyarrow падает на больших JSON (например, OverflowError в pyarrow._json.ReadOptions.block_size),
-    автоматически переключается на прямую загрузку файлов репозитория через huggingface_hub и наш локальный потоковый парсер.
+    По умолчанию сначала пытается определить raw-файлы датасета (.json/.jsonl/.zip) и,
+    если они есть, читает их напрямую через huggingface_hub + локальный потоковый парсер.
+    Это намеренно обходит путь datasets.load_dataset(...), который на больших JSON может
+    падать в pyarrow с OverflowError / DatasetGenerationError.
 
     token можно передать явно через --hf-token или через переменные окружения HF_TOKEN / HUGGINGFACE_HUB_TOKEN.
     """
     token = install_hf_token_to_env(token)
 
-    if direct_only or load_dataset is None:
-        yield from _iter_records_hf_via_hub_download(repo_id=repo_id, split=split, limit=limit, token=token)
+    direct_candidates: Optional[List[str]] = None
+    direct_detect_error: Optional[Exception] = None
+
+    if hf_hub_download is not None:
+        try:
+            direct_candidates = _hf_list_candidate_files(repo_id=repo_id, split=split, token=token)
+        except Exception as e:
+            direct_detect_error = e
+            direct_candidates = None
+
+    if direct_candidates:
+        print(f'[INFO] HF auto mode: raw data files detected for {repo_id}; using direct Hub download.', file=sys.stderr)
+        yield from _iter_records_hf_via_hub_download(
+            repo_id=repo_id,
+            split=split,
+            limit=limit,
+            token=token,
+            files=direct_candidates,
+        )
         return
+
+    if direct_only:
+        if direct_detect_error is not None:
+            raise RuntimeError(
+                f'Не удалось включить прямое чтение Hugging Face для {repo_id}: {direct_detect_error}'
+            ) from direct_detect_error
+        raise RuntimeError(
+            f'Для {repo_id} не найдены raw-файлы .json/.jsonl/.zip, а --hf-direct-only включен.'
+        )
+
+    if load_dataset is None:
+        if direct_detect_error is not None:
+            raise RuntimeError(
+                f'load_dataset недоступен, а прямое чтение Hugging Face не удалось для {repo_id}: {direct_detect_error}'
+            ) from direct_detect_error
+        raise ImportError('datasets не установлен, а прямое чтение Hugging Face не удалось определить.')
+
+    if direct_detect_error is not None:
+        print(
+            f'[WARN] HF direct auto-detect failed for {repo_id}: {direct_detect_error}. Falling back to load_dataset().',
+            file=sys.stderr,
+        )
 
     try:
         try:
@@ -385,7 +428,7 @@ def iter_records_hf(
         return
     except Exception as e:
         msg = str(e).lower()
-        if any(tok in msg for tok in ('value too large to convert to int32_t', 'readoptions.block_size', 'pyarrow._json')):
+        if any(tok in msg for tok in ('value too large to convert to int32_t', 'readoptions.block_size', 'pyarrow._json', 'datasetgenerationerror')):
             print(f'[WARN] load_dataset() failed for {repo_id}: {e}. Falling back to direct Hub download.', file=sys.stderr)
             yield from _iter_records_hf_via_hub_download(repo_id=repo_id, split=split, limit=limit, token=token)
             return
@@ -1752,7 +1795,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Options:
     p.add_argument("--hf-split", default="train")
     p.add_argument("--hf-streaming", action="store_true")
     p.add_argument("--hf-token", default=None, help="Hugging Face token. Можно передать и через HF_TOKEN / HUGGINGFACE_HUB_TOKEN.")
-    p.add_argument("--hf-direct-only", action="store_true", help="Не использовать load_dataset(); читать файлы датасета напрямую через huggingface_hub.")
+    p.add_argument("--hf-direct-only", action="store_true", help="Принудительно читать файлы датасета напрямую через huggingface_hub. Обычно raw .json/.jsonl/.zip и так выбираются автоматически.")
     p.add_argument("--num-cases", type=int, default=None)
     p.add_argument("--max-records", type=int, default=None)
     p.add_argument("--case-sampling", choices=["first", "random"], default="first")

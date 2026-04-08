@@ -45,7 +45,7 @@ bash setup.sh
 !python sudresh_expert_formatter.py ...
 ```
 
-**не сохраняет** переменную окружения для следующей строки. В документации IPython это же поведение описано на примере `!cd`: shell для `!command` сразу завершается; для переменных окружения рекомендуется использовать `%env` или задавать `os.environ` из Python. citeturn359988search1turn359988search5turn359988search9
+**не сохраняет** переменную окружения для следующей строки. В документации IPython это же поведение описано на примере `!cd`: shell для `!command` сразу завершается; для переменных окружения лучше использовать `%env` или задавать `os.environ` из Python.
 
 ## Правильные способы передать токен
 
@@ -124,11 +124,11 @@ HF_TOKEN="ваш_токен" python sudresh_expert_formatter.py \
 - `HUGGINGFACE_HUB_TOKEN`
 - `HUGGING_FACE_HUB_TOKEN`
 
-И передаётся и в `datasets.load_dataset(...)`, и в `HfApi` / `hf_hub_download(...)`. В `huggingface_hub` это официальный способ аутентифицированной загрузки: параметр `token` можно передавать строкой либо читать из локальной конфигурации. citeturn359988search2turn359988search6turn359988search14
+И передаётся и в `datasets.load_dataset(...)`, и в `HfApi` / `hf_hub_download(...)`. В `huggingface_hub` это официальный способ аутентифицированной загрузки: параметр `token` можно передавать строкой либо читать из локальной конфигурации.
 
 ## Пример запуска с Hugging Face
 
-`--hf-streaming` можно не указывать: если потоковый путь через `datasets` сработает, он будет использован; если нет, скрипт сам переключится на прямую загрузку файла из HF-репозитория.
+`--hf-streaming` обычно не нужен: для dataset repo с raw `.json/.jsonl/.zip` скрипт теперь сначала пытается читать файлы напрямую через `huggingface_hub`, чтобы не заходить в проблемный путь `Generating train split` внутри `datasets/pyarrow`.
 
 ```bash
 python sudresh_expert_formatter.py \
@@ -181,14 +181,7 @@ python sudresh_expert_formatter.py \
 
 ## Что исправлено для ошибки `OverflowError: value too large to convert to int32_t`
 
-Если на Hugging Face датасет лежит большим `json`/`jsonl`, путь `load_dataset(..., streaming=True)` может упасть внутри `pyarrow` ещё до начала обработки. Теперь скрипт:
-
-1. пробует обычный путь через `datasets`;
-2. при `OverflowError` автоматически делает fallback на `huggingface_hub`;
-3. скачивает исходный файл датасета локально из dataset repo;
-4. читает его тем же потоковым парсером, который используется для локальных `json` / `jsonl` / `zip`.
-
-Поэтому повторно менять формат датасета вручную не нужно.
+Если на Hugging Face датасет лежит большим `json`/`jsonl`, путь `load_dataset(..., streaming=True)` может упасть внутри `pyarrow` ещё до начала обработки. Теперь скрипт сначала ищет raw-файлы `.json/.jsonl/.zip` в dataset repo и читает их напрямую через `huggingface_hub` и локальный потоковый парсер. Путь через `datasets` остаётся только запасным вариантом, если raw-файлы не обнаружены.
 
 ## Важное замечание
 
