@@ -355,31 +355,15 @@ def iter_records_hf(
     direct_only: bool = False,
 ) -> Iterator[Dict[str, Any]]:
     """
-    Для dataset repos с сырыми .json/.jsonl/.zip файлами по умолчанию ПРЕДПОЧИТАЕТ прямую загрузку через huggingface_hub,
-    чтобы не попадать в pyarrow/datasets путь с "Generating train split" и OverflowError на больших JSON.
+    Сначала пробует стандартный путь через datasets.load_dataset.
+    Если HF/datasets/pyarrow падает на больших JSON (например, OverflowError в pyarrow._json.ReadOptions.block_size),
+    автоматически переключается на прямую загрузку файлов репозитория через huggingface_hub и наш локальный потоковый парсер.
 
-    Если direct mode недоступен или не подходит, используется datasets.load_dataset().
     token можно передать явно через --hf-token или через переменные окружения HF_TOKEN / HUGGINGFACE_HUB_TOKEN.
     """
     token = install_hf_token_to_env(token)
 
-    if direct_only:
-        yield from _iter_records_hf_via_hub_download(repo_id=repo_id, split=split, limit=limit, token=token)
-        return
-
-    # Для dataset repos с обычными JSON/JSONL/ZIP файлами direct-download безопаснее и стабильнее,
-    # чем load_dataset(...), который может пытаться построить Arrow split и падать на больших JSON.
-    if HfApi is not None and hf_hub_download is not None:
-        try:
-            files = _hf_list_candidate_files(repo_id=repo_id, split=split, token=token)
-            if files:
-                print(f'[INFO] HF auto mode: raw data files detected for {repo_id}; using direct Hub download.', file=sys.stderr)
-                yield from _iter_records_hf_via_hub_download(repo_id=repo_id, split=split, limit=limit, token=token)
-                return
-        except Exception as e:
-            print(f'[WARN] HF auto direct detection failed for {repo_id}: {e}. Trying datasets.load_dataset().', file=sys.stderr)
-
-    if load_dataset is None:
+    if direct_only or load_dataset is None:
         yield from _iter_records_hf_via_hub_download(repo_id=repo_id, split=split, limit=limit, token=token)
         return
 
@@ -401,7 +385,7 @@ def iter_records_hf(
         return
     except Exception as e:
         msg = str(e).lower()
-        if any(tok in msg for tok in ('value too large to convert to int32_t', 'readoptions.block_size', 'pyarrow._json', 'datasetgenerationerror')):
+        if any(tok in msg for tok in ('value too large to convert to int32_t', 'readoptions.block_size', 'pyarrow._json')):
             print(f'[WARN] load_dataset() failed for {repo_id}: {e}. Falling back to direct Hub download.', file=sys.stderr)
             yield from _iter_records_hf_via_hub_download(repo_id=repo_id, split=split, limit=limit, token=token)
             return
@@ -630,6 +614,26 @@ async def _chat_create_with_timeout(client: Any, timeout_s: Optional[int], **kwa
     return await call
 
 
+G4F_MODEL_PROVIDER_PREFERENCES: Dict[str, List[str]] = {
+    "r1-1776": ["PerplexityLabs", "Perplexity"],
+    "sonar": ["PerplexityLabs", "Perplexity"],
+    "sonar-pro": ["PerplexityLabs", "Perplexity"],
+    "sonar-reasoning": ["PerplexityLabs", "Perplexity"],
+    "sonar-reasoning-pro": ["PerplexityLabs", "Perplexity"],
+}
+
+G4F_AUTH_REQUIRED_PROVIDER_NAMES = {
+    "PuterJS", "Puter", "Gemini", "GeminiPro", "OpenRouter", "DeepInfra", "Together",
+    "HuggingFaceMedia", "HuggingFaceAPI", "Yupp", "Anthropic", "Groq",
+}
+
+
+def _provider_display_name(provider: Optional[Any]) -> Optional[str]:
+    if provider is None:
+        return None
+    return getattr(provider, "__name__", None) or provider.__class__.__name__
+
+
 def _resolve_provider(provider_name: Optional[str]):
     if provider_name is None:
         return None
@@ -638,6 +642,69 @@ def _resolve_provider(provider_name: Optional[str]):
     if not hasattr(g4f.Provider, provider_name):
         raise ValueError(f"Неизвестный provider '{provider_name}'. Смотрите g4f.Provider.*")
     return getattr(g4f.Provider, provider_name)
+
+
+def _resolve_model_provider(model: str, requested_provider_name: Optional[str]) -> Optional[Any]:
+    if g4f is None:
+        return None
+    if requested_provider_name:
+        return _resolve_provider(requested_provider_name)
+    for candidate_name in G4F_MODEL_PROVIDER_PREFERENCES.get((model or "").strip(), []):
+        if hasattr(g4f.Provider, candidate_name):
+            return getattr(g4f.Provider, candidate_name)
+    return None
+
+
+def _looks_like_api_key_error(exc: Exception) -> bool:
+    msg = str(exc or "").lower()
+    return (
+        "api key" in msg
+        or "api_key" in msg
+        or 'add a "api_key"' in msg
+        or "puter.js" in msg
+        or "puterjs" in msg
+        or "requires authentication" in msg
+    )
+
+
+def _client_supports_kwargs(cls: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        sig = inspect.signature(cls)
+        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        if has_varkw:
+            return kwargs
+        allowed = set(sig.parameters.keys())
+        return {k: v for k, v in kwargs.items() if k in allowed}
+    except Exception:
+        return kwargs
+
+
+def create_g4f_async_client(provider: Optional[Any], api_key: Optional[str]) -> Any:
+    if AsyncClient is None:
+        return None
+    kwargs: Dict[str, Any] = {}
+    if provider is not None:
+        kwargs["provider"] = provider
+    if api_key:
+        kwargs["api_key"] = api_key
+    kwargs = _client_supports_kwargs(AsyncClient, kwargs)
+    try:
+        return AsyncClient(**kwargs)
+    except TypeError:
+        return AsyncClient()
+
+
+def resolve_g4f_api_key(cli_value: Optional[str]) -> Optional[str]:
+    for value in (
+        cli_value,
+        os.environ.get("G4F_API_KEY"),
+        os.environ.get("PUTER_API_KEY"),
+        os.environ.get("OPENROUTER_API_KEY"),
+        os.environ.get("GOOGLE_API_KEY"),
+    ):
+        if value and str(value).strip():
+            return str(value).strip()
+    return None
 
 
 async def llm_format_html(
@@ -673,6 +740,10 @@ async def llm_format_html(
             return validate_or_fallback_html(target_text, str(raw))
         except Exception as e:
             last_err = e
+            if provider is not None:
+                provider_name = _provider_display_name(provider) or "unknown"
+                if _looks_like_api_key_error(e):
+                    raise RuntimeError(f"Provider {provider_name} requires api_key or interactive auth for model {model}: {e}")
             await asyncio.sleep(min(8.0, 0.7 * (2 ** (attempt - 1))))
 
     raise RuntimeError(f"LLM failed after {max_retries} retries: {last_err}")
@@ -1360,6 +1431,7 @@ class Options:
     case_ids: Optional[List[str]]
     model: str
     provider_name: Optional[str]
+    g4f_api_key: Optional[str]
     concurrency: int
     llm_max_retries: int
     llm_temperature: float
@@ -1418,11 +1490,18 @@ async def run_pipeline(opts: Options) -> int:
 
     client = None
     provider = None
+    g4f_api_key = resolve_g4f_api_key(opts.g4f_api_key)
     if AsyncClient is None:
         print("[WARN] g4f недоступен: будет использован эвристический фолбэк форматирования.", file=sys.stderr)
     else:
-        client = AsyncClient()
-        provider = _resolve_provider(opts.provider_name)
+        provider = _resolve_model_provider(opts.model, opts.provider_name)
+        if provider is not None:
+            print(f"[INFO] g4f provider selected for model {opts.model}: {_provider_display_name(provider)}", file=sys.stderr)
+        elif opts.provider_name:
+            print(f"[WARN] requested g4f provider was not resolved: {opts.provider_name}", file=sys.stderr)
+        if g4f_api_key:
+            print("[INFO] g4f api key detected and will be passed to AsyncClient.", file=sys.stderr)
+        client = create_g4f_async_client(provider=provider, api_key=g4f_api_key)
 
     cache: Dict[str, str] = {}
     processed_records: List[Dict[str, Any]] = []
@@ -1515,7 +1594,7 @@ async def run_pipeline(opts: Options) -> int:
                 "answer_engine": fields["answer"]["engine"],
                 "correct_answer_engine": fields["correct_answer"]["engine"],
                 "target_model": opts.model,
-                "target_provider": opts.provider_name,
+                "target_provider": _provider_display_name(provider) or opts.provider_name,
             },
             "fields": fields,
             "benchmark_source_sha1": bench_mappings.case_id_to_source_sha1.get(case_id),
@@ -1682,7 +1761,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Options:
     p.add_argument("--case-index", default=None)
 
     p.add_argument("--model", default="r1-1776")
-    p.add_argument("--provider", default=None)
+    p.add_argument("--provider", default=None, help="g4f.Provider.*. По умолчанию для r1-1776 будет автоматически выбран PerplexityLabs, если он доступен.")
+    p.add_argument("--g4f-api-key", default=None, help="Необязательный API key для провайдеров g4f. Также читается из G4F_API_KEY / PUTER_API_KEY / OPENROUTER_API_KEY / GOOGLE_API_KEY.")
     p.add_argument("--concurrency", type=int, default=5)
     p.add_argument("--llm-max-retries", type=int, default=3)
     p.add_argument("--llm-temperature", type=float, default=0.0)
@@ -1719,6 +1799,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Options:
         case_ids=parse_case_ids_arg(a.case_ids),
         model=a.model,
         provider_name=a.provider,
+        g4f_api_key=a.g4f_api_key,
         concurrency=max(1, int(a.concurrency)),
         llm_max_retries=max(1, int(a.llm_max_retries)),
         llm_temperature=float(a.llm_temperature),
