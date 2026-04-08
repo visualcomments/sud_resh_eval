@@ -7,7 +7,8 @@
 1. Убрана логика строгой обратимости / восстановления текста.
 2. Вместо этого добавлено **переформатирование текста** через `g4f` с моделью `r1-1776`.
 3. Сохранена логика загрузки датасетов локально и с Hugging Face.
-   - Для HF скрипт сначала пробует `datasets.load_dataset(...)`, а если большой JSON падает внутри `pyarrow`, автоматически переключается на прямую загрузку файлов через `huggingface_hub` и локальный потоковый JSON/JSONL-парсер.
+   - Для HF скрипт теперь **по умолчанию предпочитает прямую загрузку raw `.json/.jsonl/.zip` файлов** через `huggingface_hub`, чтобы не заходить в проблемный путь `datasets -> pyarrow -> Generating train split` на больших JSON.
+   - Если direct mode недоступен, используется `datasets.load_dataset(...)`; при ошибках чтения больших JSON скрипт автоматически делает fallback обратно в direct-download режим.
 4. Добавлена генерация **двух HTML-форм для экспертов**:
    - по `400` образцов на форму;
    - `100` образцов общие между двумя экспертами;
@@ -36,19 +37,99 @@ python -m pip install -U datasets huggingface_hub tqdm
 bash setup.sh
 ```
 
-Для более высоких лимитов Hugging Face и чтобы убрать предупреждение про unauthenticated requests, задайте токен заранее:
+## Почему у вас не сработал `HF_TOKEN`
+
+В `Jupyter` / `Colab` команды вида `!something` запускаются в отдельной shell-сессии. Поэтому конструкция:
 
 ```bash
-export HF_TOKEN=ваш_токен
+!export HF_TOKEN="..."
+!python sudresh_expert_formatter.py ...
 ```
 
-## Основной файл
+**не сохраняет** переменную окружения для следующей строки. В документации IPython это же поведение описано на примере `!cd`: shell для `!command` сразу завершается; для переменных окружения рекомендуется использовать `%env` или задавать `os.environ` из Python. citeturn359988search1turn359988search5turn359988search9
 
-- `sudresh_expert_formatter.py`
+## Правильные способы передать токен
+
+### Вариант 1. Самый надёжный для ноутбука: `--hf-token`
+
+```bash
+!python sudresh_expert_formatter.py \
+  --from-hf \
+  --benchmark-repo lawful-good-project/sud-resh-benchmark \
+  --evaluated-repo lawful-good-project/sud_resh_evaluated_llms_answers \
+  --out ./artifacts/processed_records.json \
+  --forms-dir ./artifacts/forms \
+  --model r1-1776 \
+  --hf-token "ваш_токен" \
+  --samples-per-expert 400 \
+  --shared-samples 100 \
+  --expert-a-name "Эксперт 1" \
+  --expert-b-name "Эксперт 2"
+```
+
+### Вариант 2. Через `%env` в Jupyter / Colab
+
+```python
+%env HF_TOKEN=ваш_токен
+```
+
+Потом обычный запуск:
+
+```bash
+!python sudresh_expert_formatter.py \
+  --from-hf \
+  --benchmark-repo lawful-good-project/sud-resh-benchmark \
+  --evaluated-repo lawful-good-project/sud_resh_evaluated_llms_answers \
+  --out ./artifacts/processed_records.json \
+  --forms-dir ./artifacts/forms \
+  --model r1-1776 \
+  --samples-per-expert 400 \
+  --shared-samples 100 \
+  --expert-a-name "Эксперт 1" \
+  --expert-b-name "Эксперт 2"
+```
+
+### Вариант 3. Через Python API окружения
+
+```python
+import os
+os.environ["HF_TOKEN"] = "ваш_токен"
+```
+
+### Вариант 4. Для обычного терминала одной командой
+
+```bash
+HF_TOKEN="ваш_токен" python sudresh_expert_formatter.py \
+  --from-hf \
+  --benchmark-repo lawful-good-project/sud-resh-benchmark \
+  --evaluated-repo lawful-good-project/sud_resh_evaluated_llms_answers \
+  --out ./artifacts/processed_records.json \
+  --forms-dir ./artifacts/forms \
+  --model r1-1776 \
+  --samples-per-expert 400 \
+  --shared-samples 100 \
+  --expert-a-name "Эксперт 1" \
+  --expert-b-name "Эксперт 2"
+```
+
+## Что теперь поддерживает скрипт
+
+Для Hugging Face скрипт теперь принимает:
+
+- `--hf-token` — явная передача токена в CLI;
+- `--hf-direct-only` — сразу читать dataset repo напрямую через `huggingface_hub`, минуя `load_dataset()`.
+
+Токен также читается автоматически из переменных:
+
+- `HF_TOKEN`
+- `HUGGINGFACE_HUB_TOKEN`
+- `HUGGING_FACE_HUB_TOKEN`
+
+И передаётся и в `datasets.load_dataset(...)`, и в `HfApi` / `hf_hub_download(...)`. В `huggingface_hub` это официальный способ аутентифицированной загрузки: параметр `token` можно передавать строкой либо читать из локальной конфигурации. citeturn359988search2turn359988search6turn359988search14
 
 ## Пример запуска с Hugging Face
 
-`--hf-streaming` можно не указывать: если потоковый путь через `datasets` сработает, он будет использован; если нет, скрипт сам переключится на прямую загрузку файла из HF-репозитория.
+`--hf-streaming` можно не указывать: для dataset repo с raw JSON/JSONL/ZIP скрипт теперь обычно сразу пойдёт в direct-download режим. Это уменьшает шанс увидеть `Generating train split` и ошибки `pyarrow` на больших файлах.
 
 ```bash
 python sudresh_expert_formatter.py \
@@ -62,6 +143,19 @@ python sudresh_expert_formatter.py \
   --shared-samples 100 \
   --expert-a-name "Эксперт 1" \
   --expert-b-name "Эксперт 2"
+```
+
+Если хотите полностью обойти путь через `datasets`, используйте:
+
+```bash
+python sudresh_expert_formatter.py \
+  --from-hf \
+  --benchmark-repo lawful-good-project/sud-resh-benchmark \
+  --evaluated-repo lawful-good-project/sud_resh_evaluated_llms_answers \
+  --hf-token "ваш_токен" \
+  --hf-direct-only \
+  --out ./artifacts/processed_records.json \
+  --forms-dir ./artifacts/forms
 ```
 
 ## Пример запуска с локальными файлами
@@ -88,12 +182,12 @@ python sudresh_expert_formatter.py \
 
 ## Что исправлено для ошибки `OverflowError: value too large to convert to int32_t`
 
-Если на Hugging Face датасет лежит большим `json`/`jsonl`, путь `load_dataset(..., streaming=True)` может упасть внутри `pyarrow` ещё до начала обработки. Теперь скрипт:
+Если на Hugging Face датасет лежит большим `json`/`jsonl`, путь `load_dataset(..., streaming=True)` или обычный `load_dataset(...)` может упасть внутри `pyarrow` ещё до начала обработки. Теперь скрипт:
 
-1. пробует обычный путь через `datasets`;
-2. при `OverflowError` автоматически делает fallback на `huggingface_hub`;
-3. скачивает исходный файл датасета локально из dataset repo;
-4. читает его тем же потоковым парсером, который используется для локальных `json` / `jsonl` / `zip`.
+1. сначала пытается определить raw data files в dataset repo;
+2. если они найдены, сразу читает их через `huggingface_hub` + локальный потоковый парсер;
+3. только если direct mode недоступен, пробует `datasets`;
+4. при `OverflowError`, `DatasetGenerationError` и родственных ошибках автоматически делает fallback на direct-download режим.
 
 Поэтому повторно менять формат датасета вручную не нужно.
 
@@ -115,3 +209,20 @@ python sudresh_expert_formatter.py \
    - финального результата.
 
 Черновик можно загрузить обратно в ту же форму.
+
+
+## Что должно измениться в логах после этой правки
+
+Для ваших HF-репозиториев нормальный лог теперь выглядит примерно так:
+
+```text
+[INFO] HF auto mode: raw data files detected for ...; using direct Hub download.
+```
+
+А строки вида:
+
+```text
+Generating train split: ...
+```
+
+для больших JSON больше появляться не должны. Если они всё-таки появились, значит запускается старая версия скрипта.

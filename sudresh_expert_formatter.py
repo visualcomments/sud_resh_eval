@@ -270,6 +270,31 @@ def iter_records_local(path: str, inner: Optional[str] = None, limit: Optional[i
     raise ValueError(f"Неизвестный формат файла: {path}")
 
 
+def _normalize_hf_token(token: Optional[str]) -> Optional[str]:
+    tok = (token or '').strip()
+    return tok or None
+
+
+def resolve_hf_token(cli_token: Optional[str] = None) -> Optional[str]:
+    tok = _normalize_hf_token(cli_token)
+    if tok:
+        return tok
+    for env_name in ('HF_TOKEN', 'HUGGINGFACE_HUB_TOKEN', 'HUGGING_FACE_HUB_TOKEN'):
+        tok = _normalize_hf_token(os.environ.get(env_name))
+        if tok:
+            return tok
+    return None
+
+
+def install_hf_token_to_env(token: Optional[str]) -> Optional[str]:
+    tok = resolve_hf_token(token)
+    if not tok:
+        return None
+    os.environ['HF_TOKEN'] = tok
+    os.environ['HUGGINGFACE_HUB_TOKEN'] = tok
+    return tok
+
+
 def _hf_is_data_file(path: str) -> bool:
     low = path.lower()
     return low.endswith('.json') or low.endswith('.jsonl') or low.endswith('.zip')
@@ -284,11 +309,11 @@ def _hf_file_priority(path: str, split: str) -> Tuple[int, int, str]:
     return (split_rank, ext_rank, low)
 
 
-def _hf_list_candidate_files(repo_id: str, split: str) -> List[str]:
+def _hf_list_candidate_files(repo_id: str, split: str, token: Optional[str] = None) -> List[str]:
     if HfApi is None:
         raise ImportError('Для прямой загрузки с Hugging Face установите huggingface_hub: pip install -U huggingface_hub')
-    api = HfApi()
-    files = api.list_repo_files(repo_id=repo_id, repo_type='dataset')
+    api = HfApi(token=resolve_hf_token(token))
+    files = api.list_repo_files(repo_id=repo_id, repo_type='dataset', token=resolve_hf_token(token))
     candidates = [f for f in files if _hf_is_data_file(f)]
     if not candidates:
         raise FileNotFoundError(f'В датасете {repo_id} не найдено файлов .json/.jsonl/.zip')
@@ -299,18 +324,19 @@ def _hf_list_candidate_files(repo_id: str, split: str) -> List[str]:
     return chosen
 
 
-def _iter_records_hf_via_hub_download(repo_id: str, split: str = 'train', limit: Optional[int] = None) -> Iterator[Dict[str, Any]]:
+def _iter_records_hf_via_hub_download(repo_id: str, split: str = 'train', limit: Optional[int] = None, token: Optional[str] = None) -> Iterator[Dict[str, Any]]:
     if hf_hub_download is None:
         raise ImportError('Для прямой загрузки с Hugging Face установите huggingface_hub: pip install -U huggingface_hub')
 
-    files = _hf_list_candidate_files(repo_id=repo_id, split=split)
+    token = install_hf_token_to_env(token)
+    files = _hf_list_candidate_files(repo_id=repo_id, split=split, token=token)
     emitted = 0
     multi_file = len(files) > 1
     if multi_file:
         print(f'[INFO] HF direct mode: найдено {len(files)} файлов-кандидатов в {repo_id}', file=sys.stderr)
 
     for filename in files:
-        local_path = hf_hub_download(repo_id=repo_id, repo_type='dataset', filename=filename)
+        local_path = hf_hub_download(repo_id=repo_id, repo_type='dataset', filename=filename, token=token)
         for rec in iter_records_local(local_path, limit=None):
             yield rec
             emitted += 1
@@ -320,18 +346,48 @@ def _iter_records_hf_via_hub_download(repo_id: str, split: str = 'train', limit:
             return
 
 
-def iter_records_hf(repo_id: str, split: str = 'train', streaming: bool = True, limit: Optional[int] = None) -> Iterator[Dict[str, Any]]:
+def iter_records_hf(
+    repo_id: str,
+    split: str = 'train',
+    streaming: bool = True,
+    limit: Optional[int] = None,
+    token: Optional[str] = None,
+    direct_only: bool = False,
+) -> Iterator[Dict[str, Any]]:
     """
-    Сначала пробует стандартный путь через datasets.load_dataset.
-    Если HF/datasets/pyarrow падает на больших JSON (например, OverflowError в pyarrow._json.ReadOptions.block_size),
-    автоматически переключается на прямую загрузку файлов репозитория через huggingface_hub и наш локальный потоковый парсер.
+    Для dataset repos с сырыми .json/.jsonl/.zip файлами по умолчанию ПРЕДПОЧИТАЕТ прямую загрузку через huggingface_hub,
+    чтобы не попадать в pyarrow/datasets путь с "Generating train split" и OverflowError на больших JSON.
+
+    Если direct mode недоступен или не подходит, используется datasets.load_dataset().
+    token можно передать явно через --hf-token или через переменные окружения HF_TOKEN / HUGGINGFACE_HUB_TOKEN.
     """
+    token = install_hf_token_to_env(token)
+
+    if direct_only:
+        yield from _iter_records_hf_via_hub_download(repo_id=repo_id, split=split, limit=limit, token=token)
+        return
+
+    # Для dataset repos с обычными JSON/JSONL/ZIP файлами direct-download безопаснее и стабильнее,
+    # чем load_dataset(...), который может пытаться построить Arrow split и падать на больших JSON.
+    if HfApi is not None and hf_hub_download is not None:
+        try:
+            files = _hf_list_candidate_files(repo_id=repo_id, split=split, token=token)
+            if files:
+                print(f'[INFO] HF auto mode: raw data files detected for {repo_id}; using direct Hub download.', file=sys.stderr)
+                yield from _iter_records_hf_via_hub_download(repo_id=repo_id, split=split, limit=limit, token=token)
+                return
+        except Exception as e:
+            print(f'[WARN] HF auto direct detection failed for {repo_id}: {e}. Trying datasets.load_dataset().', file=sys.stderr)
+
     if load_dataset is None:
-        yield from _iter_records_hf_via_hub_download(repo_id=repo_id, split=split, limit=limit)
+        yield from _iter_records_hf_via_hub_download(repo_id=repo_id, split=split, limit=limit, token=token)
         return
 
     try:
-        ds = load_dataset(repo_id, split=split, streaming=streaming)
+        try:
+            ds = load_dataset(repo_id, split=split, streaming=streaming, token=token)
+        except TypeError:
+            ds = load_dataset(repo_id, split=split, streaming=streaming, use_auth_token=token)
         count = 0
         for rec in ds:
             yield dict(rec)
@@ -341,13 +397,13 @@ def iter_records_hf(repo_id: str, split: str = 'train', streaming: bool = True, 
         return
     except OverflowError as e:
         print(f'[WARN] load_dataset() failed for {repo_id} with OverflowError: {e}. Falling back to direct Hub download.', file=sys.stderr)
-        yield from _iter_records_hf_via_hub_download(repo_id=repo_id, split=split, limit=limit)
+        yield from _iter_records_hf_via_hub_download(repo_id=repo_id, split=split, limit=limit, token=token)
         return
     except Exception as e:
         msg = str(e).lower()
-        if any(tok in msg for tok in ('value too large to convert to int32_t', 'readoptions.block_size', 'pyarrow._json')):
+        if any(tok in msg for tok in ('value too large to convert to int32_t', 'readoptions.block_size', 'pyarrow._json', 'datasetgenerationerror')):
             print(f'[WARN] load_dataset() failed for {repo_id}: {e}. Falling back to direct Hub download.', file=sys.stderr)
-            yield from _iter_records_hf_via_hub_download(repo_id=repo_id, split=split, limit=limit)
+            yield from _iter_records_hf_via_hub_download(repo_id=repo_id, split=split, limit=limit, token=token)
             return
         raise
 
@@ -1295,6 +1351,8 @@ class Options:
     evaluated_repo: str
     hf_split: str
     hf_streaming: bool
+    hf_token: Optional[str]
+    hf_direct_only: bool
     num_cases: Optional[int]
     max_records: Optional[int]
     case_sampling: str
@@ -1317,8 +1375,14 @@ class Options:
 
 
 async def run_pipeline(opts: Options) -> int:
+    hf_token = install_hf_token_to_env(opts.hf_token)
     if opts.from_hf:
-        bench_iter = iter_records_hf(opts.benchmark_repo, split=opts.hf_split, streaming=opts.hf_streaming)
+        if hf_token:
+            print('[INFO] Hugging Face token detected: authenticated Hub access enabled.', file=sys.stderr)
+        else:
+            print('[WARN] Hugging Face token not found. Requests to the Hub will be unauthenticated.', file=sys.stderr)
+    if opts.from_hf:
+        bench_iter = iter_records_hf(opts.benchmark_repo, split=opts.hf_split, streaming=opts.hf_streaming, token=opts.hf_token, direct_only=opts.hf_direct_only)
     else:
         bench_iter = iter_records_local(opts.benchmark, inner=opts.benchmark_inner)
 
@@ -1397,7 +1461,7 @@ async def run_pipeline(opts: Options) -> int:
             return html_out, "heuristic"
 
     if opts.from_hf:
-        eval_iter = iter_records_hf(opts.evaluated_repo, split=opts.hf_split, streaming=opts.hf_streaming, limit=opts.max_records)
+        eval_iter = iter_records_hf(opts.evaluated_repo, split=opts.hf_split, streaming=opts.hf_streaming, limit=opts.max_records, token=opts.hf_token, direct_only=opts.hf_direct_only)
     else:
         eval_iter = iter_records_local(opts.evaluated, inner=opts.evaluated_inner, limit=opts.max_records)
 
@@ -1608,6 +1672,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Options:
     p.add_argument("--evaluated-repo", default="lawful-good-project/sud_resh_evaluated_llms_answers")
     p.add_argument("--hf-split", default="train")
     p.add_argument("--hf-streaming", action="store_true")
+    p.add_argument("--hf-token", default=None, help="Hugging Face token. Можно передать и через HF_TOKEN / HUGGINGFACE_HUB_TOKEN.")
+    p.add_argument("--hf-direct-only", action="store_true", help="Не использовать load_dataset(); читать файлы датасета напрямую через huggingface_hub.")
     p.add_argument("--num-cases", type=int, default=None)
     p.add_argument("--max-records", type=int, default=None)
     p.add_argument("--case-sampling", choices=["first", "random"], default="first")
@@ -1644,6 +1710,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Options:
         evaluated_repo=a.evaluated_repo,
         hf_split=a.hf_split,
         hf_streaming=a.hf_streaming,
+        hf_token=a.hf_token,
+        hf_direct_only=bool(a.hf_direct_only),
         num_cases=a.num_cases,
         max_records=a.max_records,
         case_sampling=a.case_sampling,
