@@ -57,6 +57,12 @@ try:
 except Exception:
     load_dataset = None  # type: ignore
 
+try:
+    from huggingface_hub import HfApi, hf_hub_download  # type: ignore
+except Exception:
+    HfApi = None  # type: ignore
+    hf_hub_download = None  # type: ignore
+
 
 # -----------------------------
 # Progress bar
@@ -264,16 +270,86 @@ def iter_records_local(path: str, inner: Optional[str] = None, limit: Optional[i
     raise ValueError(f"Неизвестный формат файла: {path}")
 
 
-def iter_records_hf(repo_id: str, split: str = "train", streaming: bool = True, limit: Optional[int] = None) -> Iterator[Dict[str, Any]]:
-    if load_dataset is None:
-        raise ImportError("Для загрузки с Hugging Face установите пакет datasets: pip install -U datasets huggingface_hub")
-    ds = load_dataset(repo_id, split=split, streaming=streaming)
-    count = 0
-    for rec in ds:
-        yield dict(rec)
-        count += 1
-        if limit is not None and count >= limit:
+def _hf_is_data_file(path: str) -> bool:
+    low = path.lower()
+    return low.endswith('.json') or low.endswith('.jsonl') or low.endswith('.zip')
+
+
+def _hf_file_priority(path: str, split: str) -> Tuple[int, int, str]:
+    low = path.lower()
+    base = low.rsplit('/', 1)[-1]
+    split_low = (split or '').lower()
+    ext_rank = 0 if low.endswith('.jsonl') else 1 if low.endswith('.json') else 2 if low.endswith('.zip') else 9
+    split_rank = 0 if (f'/{split_low}' in low or base.startswith(split_low) or f'-{split_low}' in base or f'_{split_low}' in base) else 1
+    return (split_rank, ext_rank, low)
+
+
+def _hf_list_candidate_files(repo_id: str, split: str) -> List[str]:
+    if HfApi is None:
+        raise ImportError('Для прямой загрузки с Hugging Face установите huggingface_hub: pip install -U huggingface_hub')
+    api = HfApi()
+    files = api.list_repo_files(repo_id=repo_id, repo_type='dataset')
+    candidates = [f for f in files if _hf_is_data_file(f)]
+    if not candidates:
+        raise FileNotFoundError(f'В датасете {repo_id} не найдено файлов .json/.jsonl/.zip')
+
+    split_matches = [f for f in candidates if _hf_file_priority(f, split)[0] == 0]
+    chosen = split_matches or candidates
+    chosen = sorted(chosen, key=lambda x: _hf_file_priority(x, split))
+    return chosen
+
+
+def _iter_records_hf_via_hub_download(repo_id: str, split: str = 'train', limit: Optional[int] = None) -> Iterator[Dict[str, Any]]:
+    if hf_hub_download is None:
+        raise ImportError('Для прямой загрузки с Hugging Face установите huggingface_hub: pip install -U huggingface_hub')
+
+    files = _hf_list_candidate_files(repo_id=repo_id, split=split)
+    emitted = 0
+    multi_file = len(files) > 1
+    if multi_file:
+        print(f'[INFO] HF direct mode: найдено {len(files)} файлов-кандидатов в {repo_id}', file=sys.stderr)
+
+    for filename in files:
+        local_path = hf_hub_download(repo_id=repo_id, repo_type='dataset', filename=filename)
+        for rec in iter_records_local(local_path, limit=None):
+            yield rec
+            emitted += 1
+            if limit is not None and emitted >= limit:
+                return
+        if not multi_file:
             return
+
+
+def iter_records_hf(repo_id: str, split: str = 'train', streaming: bool = True, limit: Optional[int] = None) -> Iterator[Dict[str, Any]]:
+    """
+    Сначала пробует стандартный путь через datasets.load_dataset.
+    Если HF/datasets/pyarrow падает на больших JSON (например, OverflowError в pyarrow._json.ReadOptions.block_size),
+    автоматически переключается на прямую загрузку файлов репозитория через huggingface_hub и наш локальный потоковый парсер.
+    """
+    if load_dataset is None:
+        yield from _iter_records_hf_via_hub_download(repo_id=repo_id, split=split, limit=limit)
+        return
+
+    try:
+        ds = load_dataset(repo_id, split=split, streaming=streaming)
+        count = 0
+        for rec in ds:
+            yield dict(rec)
+            count += 1
+            if limit is not None and count >= limit:
+                return
+        return
+    except OverflowError as e:
+        print(f'[WARN] load_dataset() failed for {repo_id} with OverflowError: {e}. Falling back to direct Hub download.', file=sys.stderr)
+        yield from _iter_records_hf_via_hub_download(repo_id=repo_id, split=split, limit=limit)
+        return
+    except Exception as e:
+        msg = str(e).lower()
+        if any(tok in msg for tok in ('value too large to convert to int32_t', 'readoptions.block_size', 'pyarrow._json')):
+            print(f'[WARN] load_dataset() failed for {repo_id}: {e}. Falling back to direct Hub download.', file=sys.stderr)
+            yield from _iter_records_hf_via_hub_download(repo_id=repo_id, split=split, limit=limit)
+            return
+        raise
 
 
 # -----------------------------
