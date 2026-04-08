@@ -757,7 +757,7 @@ async def llm_format_html(
     context_text: str,
     model: str,
     provider: Optional[Any],
-    max_retries: int = 3,
+    max_retries: int = 10,
     temperature: float = 0.0,
     max_tokens: int = 2200,
     request_timeout_s: Optional[int] = None,
@@ -787,7 +787,12 @@ async def llm_format_html(
                 provider_name = _provider_display_name(provider) or "unknown"
                 if _looks_like_api_key_error(e):
                     raise RuntimeError(f"Provider {provider_name} requires api_key or interactive auth for model {model}: {e}")
-            await asyncio.sleep(min(8.0, 0.7 * (2 ** (attempt - 1))))
+
+            # Экспоненциальный backoff с небольшим jitter, чтобы не бомбить provider burst-запросами.
+            # Это согласуется с best practices из документации g4f для async usage.
+            delay = min(45.0, (1.25 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.75))
+            if attempt < max_retries:
+                await asyncio.sleep(delay)
 
     raise RuntimeError(f"LLM failed after {max_retries} retries: {last_err}")
 
@@ -1476,6 +1481,7 @@ class Options:
     provider_name: Optional[str]
     g4f_api_key: Optional[str]
     concurrency: int
+    llm_semaphore: int
     llm_max_retries: int
     llm_temperature: float
     llm_max_tokens: int
@@ -1550,6 +1556,10 @@ async def run_pipeline(opts: Options) -> int:
     processed_records: List[Dict[str, Any]] = []
     out_path = Path(opts.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    llm_sem = asyncio.Semaphore(max(1, opts.llm_semaphore))
+    if client:
+        print(f"[INFO] g4f concurrency gate enabled: max {max(1, opts.llm_semaphore)} in-flight formatting request(s)", file=sys.stderr)
+        print(f"[INFO] g4f retries enabled: up to {opts.llm_max_retries} attempts per field", file=sys.stderr)
 
     async def format_field(field_name: str, text: str, context_text: str) -> Tuple[str, str]:
         key = hashlib.sha1((field_name + "\0" + context_text + "\0" + text).encode("utf-8")).hexdigest()
@@ -1562,18 +1572,19 @@ async def run_pipeline(opts: Options) -> int:
             return html_out, "heuristic"
 
         try:
-            html_out = await llm_format_html(
-                client=client,
-                target_text=text,
-                target_name=field_name,
-                context_text=context_text,
-                model=opts.model,
-                provider=provider,
-                max_retries=opts.llm_max_retries,
-                temperature=opts.llm_temperature,
-                max_tokens=opts.llm_max_tokens,
-                request_timeout_s=opts.llm_timeout_s,
-            )
+            async with llm_sem:
+                html_out = await llm_format_html(
+                    client=client,
+                    target_text=text,
+                    target_name=field_name,
+                    context_text=context_text,
+                    model=opts.model,
+                    provider=provider,
+                    max_retries=opts.llm_max_retries,
+                    temperature=opts.llm_temperature,
+                    max_tokens=opts.llm_max_tokens,
+                    request_timeout_s=opts.llm_timeout_s,
+                )
             cache[key] = html_out
             return html_out, "g4f"
         except Exception as e:
@@ -1807,7 +1818,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Options:
     p.add_argument("--provider", default=None, help="g4f.Provider.*. По умолчанию для r1-1776 будет автоматически выбран PerplexityLabs, если он доступен.")
     p.add_argument("--g4f-api-key", default=None, help="Необязательный API key для провайдеров g4f. Также читается из G4F_API_KEY / PUTER_API_KEY / OPENROUTER_API_KEY / GOOGLE_API_KEY.")
     p.add_argument("--concurrency", type=int, default=5)
-    p.add_argument("--llm-max-retries", type=int, default=3)
+    p.add_argument("--llm-semaphore", type=int, default=1, help="Максимум одновременных g4f-запросов. По умолчанию 1, чтобы снизить риск блокировки provider.")
+    p.add_argument("--llm-max-retries", type=int, default=10)
     p.add_argument("--llm-temperature", type=float, default=0.0)
     p.add_argument("--llm-max-tokens", type=int, default=2200)
     p.add_argument("--llm-timeout-s", type=int, default=90)
@@ -1844,6 +1856,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> Options:
         provider_name=a.provider,
         g4f_api_key=a.g4f_api_key,
         concurrency=max(1, int(a.concurrency)),
+        llm_semaphore=max(1, int(a.llm_semaphore)),
         llm_max_retries=max(1, int(a.llm_max_retries)),
         llm_temperature=float(a.llm_temperature),
         llm_max_tokens=max(256, int(a.llm_max_tokens)),

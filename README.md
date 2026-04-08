@@ -6,13 +6,17 @@
 
 1. Убрана логика строгой обратимости / восстановления текста.
 2. Вместо этого добавлено **переформатирование текста** через `g4f` с моделью `r1-1776` и корректным async-доступом через provider `PerplexityLabs` по умолчанию для этой модели.
-3. Сохранена логика загрузки датасетов локально и с Hugging Face.
+3. Для `g4f` добавлена дополнительная защита от блокировок:
+   - отдельный `asyncio.Semaphore` на LLM-запросы;
+   - `retry` по умолчанию до `10` попыток;
+   - экспоненциальный backoff с небольшим jitter между повторами.
+4. Сохранена логика загрузки датасетов локально и с Hugging Face.
    - Для HF dataset repo с raw `json/jsonl/zip` скрипт по умолчанию сразу использует прямую загрузку файлов через `huggingface_hub` и локальный потоковый JSON/JSONL-парсер, чтобы не упираться в `pyarrow` при больших файлах.
-4. Добавлена генерация **двух HTML-форм для экспертов**:
+5. Добавлена генерация **двух HTML-форм для экспертов**:
    - по `400` образцов на форму;
    - `100` образцов общие между двумя экспертами;
    - модельные оценки сохраняются в экспортируемый JSON, но **не показываются в интерфейсе**.
-5. В формы добавлены функции для комфортного заполнения:
+6. В формы добавлены функции для комфортного заполнения:
    - autosave в `localStorage`;
    - экспорт и импорт черновика;
    - экспорт итогового JSON;
@@ -82,6 +86,8 @@ bash setup.sh
   --out ./artifacts/processed_records.json \
   --forms-dir ./artifacts/forms \
   --model r1-1776 \
+  --llm-semaphore 1 \
+  --llm-max-retries 10 \
   --samples-per-expert 400 \
   --shared-samples 100 \
   --expert-a-name "Эксперт 1" \
@@ -105,11 +111,27 @@ HF_TOKEN="ваш_токен" python sudresh_expert_formatter.py \
   --out ./artifacts/processed_records.json \
   --forms-dir ./artifacts/forms \
   --model r1-1776 \
+  --llm-semaphore 1 \
+  --llm-max-retries 10 \
   --samples-per-expert 400 \
   --shared-samples 100 \
   --expert-a-name "Эксперт 1" \
   --expert-b-name "Эксперт 2"
 ```
+
+## Что добавлено против блокировки `g4f`
+
+Скрипт теперь принимает дополнительные параметры для ограничения нагрузки на provider:
+
+- `--llm-semaphore` — максимум одновременных `g4f`-запросов;
+- `--llm-max-retries` — число попыток для одного LLM-вызова.
+
+По умолчанию теперь используются безопасные значения:
+
+- `--llm-semaphore 1`
+- `--llm-max-retries 10`
+
+Это сделано специально для снижения риска временных блокировок, rate limit и нестабильных ответов у `g4f`-provider.
 
 ## Что теперь поддерживает скрипт
 
@@ -166,6 +188,8 @@ python sudresh_expert_formatter.py \
   --out ./artifacts/processed_records.json \
   --forms-dir ./artifacts/forms \
   --model r1-1776 \
+  --llm-semaphore 1 \
+  --llm-max-retries 10 \
   --samples-per-expert 400 \
   --shared-samples 100
 ```
