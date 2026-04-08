@@ -639,6 +639,16 @@ def build_llm_messages(target_text: str, target_name: str, context_text: str) ->
     ]
 
 
+def _is_outer_task_cancelled() -> bool:
+    task = asyncio.current_task()
+    if task is None:
+        return False
+    try:
+        return task.cancelling() > 0
+    except Exception:
+        return task.cancelled()
+
+
 async def _chat_create_with_timeout(client: Any, timeout_s: Optional[int], **kwargs: Any) -> Any:
     if "provider" in kwargs and kwargs["provider"] is None:
         kwargs.pop("provider", None)
@@ -651,10 +661,16 @@ async def _chat_create_with_timeout(client: Any, timeout_s: Optional[int], **kwa
             kwargs = {k: v for k, v in kwargs.items() if k in allowed}
     except Exception:
         pass
+
     call = client.chat.completions.create(**kwargs)
-    if timeout_s and timeout_s > 0:
-        return await asyncio.wait_for(call, timeout=float(timeout_s))
-    return await call
+    try:
+        if timeout_s and timeout_s > 0:
+            return await asyncio.wait_for(call, timeout=float(timeout_s))
+        return await call
+    except asyncio.CancelledError as e:
+        if _is_outer_task_cancelled():
+            raise
+        raise RuntimeError("g4f request was cancelled unexpectedly by provider/session") from e
 
 
 G4F_MODEL_PROVIDER_PREFERENCES: Dict[str, List[str]] = {
@@ -781,6 +797,10 @@ async def llm_format_html(
             if raw is None or not str(raw).strip():
                 raise ValueError("Empty LLM response")
             return validate_or_fallback_html(target_text, str(raw))
+        except asyncio.CancelledError as e:
+            if _is_outer_task_cancelled():
+                raise
+            last_err = RuntimeError(f"Unexpected CancelledError from provider for model {model}")
         except Exception as e:
             last_err = e
             if provider is not None:
@@ -793,6 +813,10 @@ async def llm_format_html(
             delay = min(45.0, (1.25 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.75))
             if attempt < max_retries:
                 await asyncio.sleep(delay)
+                continue
+        delay = min(45.0, (1.25 * (2 ** (attempt - 1))) + random.uniform(0.0, 0.75))
+        if attempt < max_retries:
+            await asyncio.sleep(delay)
 
     raise RuntimeError(f"LLM failed after {max_retries} retries: {last_err}")
 
@@ -1587,6 +1611,13 @@ async def run_pipeline(opts: Options) -> int:
                 )
             cache[key] = html_out
             return html_out, "g4f"
+        except asyncio.CancelledError as e:
+            if _is_outer_task_cancelled():
+                raise
+            print(f"[WARN] Formatting fallback for {field_name}: unexpected CancelledError from provider: {e}", file=sys.stderr)
+            html_out = heuristic_format_html(text)
+            cache[key] = html_out
+            return html_out, "heuristic"
         except Exception as e:
             print(f"[WARN] Formatting fallback for {field_name}: {e}", file=sys.stderr)
             html_out = heuristic_format_html(text)
