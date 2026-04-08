@@ -1,0 +1,4 @@
+g4f
+datasets
+huggingface_hub
+tqdm
